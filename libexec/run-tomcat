@@ -1,0 +1,120 @@
+#!/bin/bash
+#
+# run-tomcat
+#
+# APP_X_NAME and TOMCAT_HOME should be defined.
+# Applications should be delivered into <APP>_HOME/webapps.
+#
+# Configuration environment variables
+#   <APP>_HOME        place where web application was deployed, default is ${HOME}/${APP_X_NAME};
+#   <APP>_CONF_DIR    configuration files, will be copied into 'conf', if it not equal to ${APP_HOME}/conf;
+#   <APP>_LOG         log folder, symlink 'logs' will be created into $APP_HOME/logs.
+#   <APP>_JMX_HOST    jmx host
+#   <APP>_JMX_PORT    jmx port
+#   <APP>_DEBUG_PORT  debug port
+#
+# Be careful with default tomcat's configuration files: it will be copied only once.
+#
+
+if [ "x$APP_X_NAME" == "x" ]; then
+    echo "APP_X_NAME is not defined. If you need to run script without appctl please specify all required exports."
+    exit 1
+fi
+
+[ "x$TOMCAT_HOME" == "x" ] && { echo "TOMCAT_HOME should be defined. Exiting."; exit 1; }
+
+TOMCAT_CONF_FILES="logging.properties catalina.properties web.xml server.xml"
+
+# configuration variables
+app_name=${APP_X_NAME//\-/\_}
+app_name=${app_name^^}
+home_dir="${app_name}_HOME"
+conf_dir="${app_name}_CONF_DIR"
+log_dir="${app_name}_LOG_DIR"
+jmx_port="${app_name}_JMX_PORT"
+jmx_host="${app_name}_JMX_HOST"
+debug_port="${app_name}_DEBUG_PORT"
+
+# application's environment
+APP_HOME=${!home_dir:-"${HOME}/${APP_X_NAME}"}
+APP_CONF_DIR=${!conf_dir}
+APP_LOG_DIR=${!log_dir}
+
+# prepare required folders structure
+mkdir -p $APP_HOME $APP_HOME/conf $APP_HOME/temp $APP_HOME/webapps
+
+# construct configuration from $APP_CONF_DIR and $TOMCAT_HOME/conf
+if [ -d "$APP_CONF_DIR" ]; then
+  APP_CONF_DIR=$(cd $APP_CONF_DIR && pwd)
+  if [ "$APP_CONF_DIR" != "$APP_HOME/conf" ]; then
+    # copy custom tomcat's configuration files if exist
+    for f in ${TOMCAT_CONF_FILES}; do
+      [ -f $APP_CONF_DIR/$f ] && cp $APP_CONF_DIR/$f $APP_HOME/conf
+    done
+  fi
+else
+  if [ "x$APP_CONF_DIR" != "x" ]; then
+    echo "$conf_dir defined but folder '$APP_CONF_DIR' doesn't exist"
+    exit 1
+  fi
+  APP_CONF_DIR=$APP_HOME/conf
+fi
+# copy default tomcat's configuration files to $APP_HOME/conf
+for f in ${TOMCAT_CONF_FILES}; do
+  [ ! -f $APP_HOME/conf/$f ] && cp $TOMCAT_HOME/conf/$f $APP_HOME/conf
+done
+
+# logs
+if [ -d "$APP_LOG_DIR" ]; then
+  APP_LOG_DIR=$(cd $APP_LOG_DIR && pwd)
+  if [ "$APP_LOG_DIR" != "$APP_HOME/logs" ]; then
+    if [ -d "$APP_HOME/logs" ]; then
+      if [ -L "$APP_HOME/logs" ]; then
+        rm $APP_HOME/logs
+      else
+        mv $APP_HOME/logs $APP_HOME/logs.$$
+      fi
+      ln -s $APP_LOG_DIR $APP_HOME/logs
+    fi
+  fi
+else
+  mkdir -p $APP_HOME/logs
+  APP_LOG_DIR=$APP_HOME/logs
+fi
+
+# enable java debug port if necessary variable are defined
+if [ "x${!debug_port}" != "x" ]; then
+       export JAVA_OPTS="$JAVA_OPTS -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=${!debug_port}"
+fi
+
+# enable jmx if necessary variables are defined
+if [ "x${!jmx_port}" != "x" -a "x${!jmx_host}" != "x" ]; then
+  export JAVA_OPTS="$JAVA_OPTS -Dcom.sun.management.jmxremote \
+  -Dcom.sun.management.jmxremote.authenticate=false \
+  -Dcom.sun.management.jmxremote.ssl=false \
+  -Dcom.sun.management.jmxremote.port=${!jmx_port} \
+  -Dcom.sun.management.jmxremote.rmi.port=${!jmx_port} \
+  -Djava.rmi.server.hostname=${!jmx_host}"
+
+fi
+
+export JAVA_OPTS="$JAVA_OPTS -ea -XX:+PrintGCDetails -XX:+PrintGCDateStamps -XX:+HeapDumpOnOutOfMemoryError -Xloggc:${APP_LOG_DIR}/${APP_X_NAME}-gc.log"
+
+# tomcat exports
+export CATALINA_HOME=$TOMCAT_HOME
+export CATALINA_BASE=$APP_HOME
+export CATALINA_OUT=$APP_LOG_DIR/${APP_X_NAME}.out
+export CATALINA_TMPDIR=$APP_HOME/temp
+export CATALINA_PID=$APP_X_PID_FILE
+
+# java options
+OPTIONS=''
+for opt in $(set | grep '_JOPT=' | awk -F= '{print $1}'); do
+    OPTIONS="$OPTIONS ${!opt}"
+done
+export JAVA_OPTS="$JAVA_OPTS $OPTIONS"
+
+# run tomcat
+$TOMCAT_HOME/bin/catalina.sh start
+
+# EOF

@@ -1,0 +1,10 @@
+# ${APP_CONF_DIR}/app.hosts
+#
+# Applications' layout by host. Only applications defined here is under appctl control.
+#
+# Syntax: host app1,app2,...
+# 
+
+localhost hdfs,hbase,mysql,elasticsearch,haproxy,fullhouse,dashboard,admin
+
+# EOF

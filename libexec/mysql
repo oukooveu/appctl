@@ -1,0 +1,17 @@
+#!/bin/bash
+#
+# appctl start script for mysql (binary distribution)
+#
+
+. $(cd $(dirname $0) && pwd)/export.inc || exit 1
+
+MYSQL_CONF_DIR=${MYSQL_CONF_DIR:-$MYSQL_HOME}
+MYSQL_LOG_DIR=${MYSQL_LOG_DIR:-$MYSQL_HOME/logs}
+
+[ -d "${MYSQL_LOG_DIR}" ] || mkdir -p ${MYSQL_LOG_DIR}
+
+cd ${MYSQL_HOME}
+
+${MYSQL_HOME}/bin/mysqld_safe --defaults-file=${MYSQL_CONF_DIR}/my.cnf --nowatch --pid-file=${APP_X_PID_FILE} 2>&1
+
+# EOF

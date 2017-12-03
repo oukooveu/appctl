@@ -1,0 +1,710 @@
+#!/bin/bash
+#
+# appctl
+#
+# Simple script to synchronize files and run commands at remote hosts
+#
+# Environment variables
+#   Option          | Default value            | Description
+#   APP_HOME        | ${runpath}/..            | appctl bundle location
+#   APP_CONF_DIR    | ${APP_HOME}/conf         | app.hosts, app.conf, app.env 
+#   APP_BIN_DIR     | ${APP_HOME}/bin          | appctl and related scripts
+#   APP_EXEC_DIR    | ${APP_HOME}/libexec      | scripts for applications' control
+#   APP_LOG_DIR     | ${APP_HOME}/logs         | appctl's log location
+#   APP_PID_DIR     | ${APP_HOME}/run          | scripts' pid files location
+#   APP_OLD_PID_DIR | --                       | for backward compatibility (should be defined if APP_PID_DIR is changed)
+#   APP_LOG_LEVEL   | info                     | log level
+#   APP_SYNC_PATH   | APP_{CONF,BIN,EXEC}_DIR  | list of files and directories for synchronization 
+#
+# Exports: APP_X_NAME, APP_X_PID_FILE
+#
+# Exit status codes:
+#   0: application is running
+#   1: not running or there is no pid
+#   2: stale pid file
+#   255: don't know how to operate (can't find action script when it's required)
+#
+
+#set -x
+
+#
+# Options
+#
+
+APP_VERSION="0.0.1"
+
+[ "${BASH_VERSION%%.*}" -lt 4 ] && { echo "bash version should not be less than 4.x"; exit 1; }
+
+runpath="$(cd $(dirname $0) && pwd)"
+script="$runpath/$(basename $0)"
+apphost=$(hostname)
+
+APP_HOME=${APP_HOME:-$(cd "$runpath/.." && pwd)}
+APP_CONF_DIR=${APP_CONF_DIR:-$APP_HOME/conf}
+
+[ -f $APP_CONF_DIR/app.env ] && . $APP_CONF_DIR/app.env
+
+APP_BIN_DIR=${APP_BIN_DIR:-$APP_HOME/bin}
+APP_EXEC_DIR=${APP_EXEC_DIR:-$APP_HOME/libexec}
+APP_LOG_DIR=${APP_LOG_DIR:-$APP_HOME/logs}
+APP_PID_DIR=${APP_PID_DIR:-$APP_HOME/run}
+
+# Check for directories
+[ -d ${APP_LOG_DIR} ] || mkdir -p ${APP_LOG_DIR}
+[ -d ${APP_PID_DIR} ] || mkdir -p ${APP_PID_DIR}
+
+# Configuration files
+HOSTS_CONF=$APP_CONF_DIR/app.hosts
+APPS_CONF=$APP_CONF_DIR/app.conf
+
+# Logging
+APP_LOG_FILE="${APP_LOG_DIR}/appctl-$apphost.log"
+APP_LOG_LEVELS='debug info warning error critical'
+APP_LOG_LEVEL=${APP_LOG_LEVEL:-'info'}
+APP_OUT_LOG_LEVEL='debug'
+
+# Supported features and options
+APP_ACTIONS="start stop restart status"
+APP_REVERSE_ACTIONS="stop"
+APPCTL_ACTIONS="sync $APP_ACTIONS"
+
+declare -A APPCTL_DEFAULT_OPTIONS=( \
+  ["control"]="disable" \
+  ["start_delay"]=1 \
+  ["stop_delay"]=1 \
+)
+
+# Rsync options
+RSYNC_OPTS="-aHAXx --numeric-ids --delete"
+RSYNC_SSH_OPTS="-T -c arcfour -o Compression=no -x"
+RSYNC_INCLUDE_PATH="$APP_CONF_DIR $APP_BIN_DIR $APP_EXEC_DIR"
+
+#
+# Functions
+#
+
+usage()
+{
+command=$(basename $0)
+cat <<EOF
+$command version $APP_VERSION
+
+usage:
+    $command [options] action { all | app1 app2 ... }
+    $command { --local | -l } [options] action application [application's options]
+
+    options:
+           --help               print this help and exit;
+           --version            print script's version and exit;
+        -l|--local              run at localhost (only one application with options);
+        -f|--force              force action;
+        -h|--hosts {h1,h2,...}  run commands on dedicated hosts (application should be configured to run on them).
+
+        caution: run with local option doesn't check 'app.hosts', combine local and non-local runs carefully.
+
+    actions (required):
+        sync    sync binary and configuration files;
+        start   start application;
+        stop    stop application;
+        restart restart application;
+        status  check application's status.
+
+    "all" keyword for applications means 'all configured applications at all configured hosts'.
+
+EOF
+}
+
+#
+# usage: log level message
+# write log message with level is equal or great than $APP_LOG_LEVEL to $APP_LOG_FILE
+# log levels are defined in $APP_LOG_LEVELS
+#
+log()
+{
+    local level
+
+    if [ -z ${1} ]; then
+        level=${APP_LOG_LEVEL}
+    else
+        level=$1
+        shift
+    fi
+
+    local level_ge_default=0
+    for l in ${APP_LOG_LEVELS}; do
+        [ "$l" == "$APP_LOG_LEVEL" ] && level_ge_default=1
+        if [ "$l" == "$level" ]; then
+            if [ $level_ge_default -gt 0 ]; then
+                local date=$(date +"%Y-%m-%d %T,%3N")
+                echo -e "$date\t${level}\t$@" >> ${APP_LOG_FILE}
+            fi
+            break
+        fi
+    done
+}
+
+# TODO can be removed (function was used in conjunction with PIPESTATUS)
+pipe_log()
+{
+    while read -r line; do
+        log $APP_OUT_LOG_LEVEL $line
+    done
+}
+
+trim() {
+    local v="$*"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    echo -n "$v"
+}
+
+conf_cut()
+{
+    [ -f "$1" ] || { echo ""; return; }
+    sed 's/\#.*//;s/^[[:blank:]]*//' $1 | grep -v ^$
+}
+
+# return all 'known' hosts except current one
+sync_hosts()
+{
+    echo $(conf_cut $HOSTS_CONF | awk '{print $1}' | grep -v $apphost)
+}
+
+# return hosts where application is configured to run
+app_hosts()
+{
+    echo $(conf_cut $HOSTS_CONF | grep -E "(,|\s)$1(,|\s|$)" | awk '{print $1}')
+}
+
+# return all 'known' applications (app.conf)
+all_configured_apps()
+{
+    echo $(conf_cut $APPS_CONF | awk '{print $1}' 2>/dev/null)
+}
+
+# return all 'allowed' applications (app.hosts)
+all_allowed_apps()
+{
+    echo $(conf_cut $HOSTS_CONF | sed 's/^[^[:space:]]*\s*//;s/\s*,\s*/\n/g' | sort -u)
+}
+
+full_command_path()
+{
+    echo "$(cd $(dirname $1) && pwd)/$(basename $1)"
+}
+
+# looking for executable in APP_EXEC_DIR (first) and in PATH (second)
+find_exec()
+{
+    local script=$1; shift
+    local options=$@
+    local app_script=''
+
+    if [ -x "$APP_EXEC_DIR/$script" ]; then
+        app_script="$APP_EXEC_DIR/$script"
+    else
+        cmd=$(type -p $script)
+        if [ -x "$cmd" ]; then
+            app_script=$cmd
+        else
+            return 1
+        fi
+    fi
+
+    echo "$app_script $options"
+    return 0
+}
+
+# print formatted status
+print_status()
+{
+    local app=$1
+    local msg=$2
+
+    printf "%-16s %-24s %s\n" $apphost $app "[$msg]"
+}
+
+#
+# Main
+#
+
+# Command line options processing
+
+[ $# -eq 0 ] && { usage; exit 1; }
+
+force=0
+local_run=0
+local_options=''
+global_options=''
+
+while [ "${1:0:1}" == "-" -a $# -gt 0 ]; do
+    global_options="$global_options $1"
+    case $1 in
+        --help|-help)
+            usage
+            exit
+            ;;
+        --force|-f)
+            force=1
+            local_options='-f'
+            shift
+            ;;
+        --hosts|-h)
+            hosts=$2
+            [ "x$hosts" == "x" ] && { usage; exit 1; }
+            global_options="$global_options $2"
+            shift 2
+            ;;
+        --local|-l)
+            local_run=1
+            shift
+            ;;
+        --version)
+            echo "$(basename $0) version: $APP_VERSION"
+            exit 0
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+[ $# -eq 0 ] && { usage; exit 1; }
+
+[ "${APPCTL_ACTIONS/$1}" = "${APPCTL_ACTIONS}" ] && { echo -e "Unknown action \"$action\". Exiting...\n"; usage; exit 1; }
+
+action=$1
+shift
+
+# take care of 'composite' actions (restart only for now)
+if [ "x$action" == "xrestart" ]; then
+    exit_status=0
+
+    $script $global_options stop $@
+    exit_status=$(( $exit_status + $? ))
+
+    $script $global_options start $@
+    exit_status=$(( $exit_status + $? ))
+
+    exit $exit_status
+fi
+
+#
+# Sync files
+#
+
+if [ "$action" == "sync" ]; then
+
+    # if hosts are not passed via options -- sync all "known" hosts
+    if [ "x$hosts" == "x" ]; then
+        hosts=$(sync_hosts)
+    else
+        hosts=${hosts//,/ }
+    fi
+
+    for syncdir in $APP_SYNC_PATH; do
+        if [ ${syncdir:0:1} != '/' ]; then
+            log 'warning' "relative paths (\"$syncdir\") are not supported"
+        else
+            RSYNC_INCLUDE_PATH="$RSYNC_INCLUDE_PATH $syncdir"
+        fi
+    done
+
+    log 'info' "synchronization has been started, hosts: $hosts, paths: $RSYNC_INCLUDE_PATH"
+
+    # start rsync (each path separetly because rsync can interfere with itself)
+    status=0
+    for rs in $RSYNC_INCLUDE_PATH; do
+
+        [ -d $rs ] && rs="$rs/"
+
+        rpids=''
+        for host in $hosts; do
+            rsync $RSYNC_OPTS -e "ssh $RSYNC_SSH_OPTS" $rs $host:$rs 1>/dev/null 2>&1 &
+            rpid=$!
+            rpids="$rpids $rpid"
+            eval rlog_$rpid=\"destination host: \'$host\', directory: \'$rs\'\"
+        done
+
+        # waiting and checking exit statuses
+        for p in $rpids; do
+            wait $p
+            if [ $? -gt 0 ]; then
+                rlog_var="rlog_$p"
+                log 'error' "rsync process has been failed, ${!rlog_var}"
+                unset rlog_var
+                status=$(( $status + 1 ))
+            fi
+            unset rlog_$p
+        done
+
+    done
+
+    log 'info' "synchronization has been finished, status code is \"$status\""
+    exit $status
+
+fi # $action == 'sync'
+
+#
+# First run (run commands via ssh)
+#
+
+if [ $local_run -eq 0 ]; then
+
+    if [ $# -eq 0 ]; then
+        usage
+        exit 1
+    fi
+
+    # run itself to be sure files are in sync (only for start action)
+    if [ "x$action" == "xstart" ]; then
+        $script ${hosts+--hosts ${hosts}} sync
+        if [ $? -ne 0 ]; then
+            echo "error: synchronization has been failed (examine log for details)"
+            exit 127
+        fi
+    fi
+
+    # probably this is first run, we have to determine application(s)
+    # and run all applications in order defined in configuration (app.conf)
+    apps=$@
+    if [ "x${apps,,}" == "xall" ]; then
+        apps=$(all_allowed_apps)
+        if [ "x$apps" == "x" ]; then
+            echo "error: there are no allowed applications for action '${action}'"
+            exit 1
+        fi
+    fi
+    log 'info' "action: \"$action\", application(s): \"$apps\""
+
+    # applications should be sorted by order defined in app.conf
+    # create 'ordered' array for all configured applications
+    i=0
+    declare -A conf_order
+    for a in $(all_configured_apps)
+    do
+        conf_order[$a]=$i
+        i=$((i+1))
+    done
+    # get application from app.hosts and...
+    declare -A host_order
+    for a in $apps
+    do
+        # if there is no key in conf_order print status and continue
+        if [ "x${conf_order[$a]}" == "x" ]; then
+            log 'warning' "application $a is not configured (check app.conf and app.hosts)"
+            print_status $a 'noconf'
+            continue
+        fi
+        host_order[$a]=${conf_order[$a]}
+    done
+    # ...put it in correct order
+    apps=$(
+        for x in ${!host_order[@]}
+        do
+            echo "${host_order[$x]} $x"
+        done | sort -n -k1 | cut -d' ' -f2
+    )
+    # reverse order (for specific actions)
+    if [[ "$action" =~ $APP_REVERSE_ACTIONS ]]; then
+        r_apps=''
+        for a in $apps; do r_apps="$a $r_apps"; done
+        apps=$r_apps
+    fi
+
+    # run commands (at all hosts per application)
+    for app in $apps; do
+
+        app_hosts=$(app_hosts $app)
+
+        log 'debug' "application: \"$app\", hosts: \"$app_hosts\""
+
+        for host in $app_hosts; do
+            # if hosts provided via command line we should check is application configured at this hosts
+            if [ "x$hosts" != "x" ]; then
+                [ "$hosts" == "${hosts/${host}/}" ] && continue
+            fi
+            log 'debug' "ssh command: ssh $host $script --local $local_options $action $app"
+            ssh $host $script --local $local_options $action $app 2>&1 &
+        done
+        wait
+
+    done
+
+    exit
+
+fi # $local_run -eq 0
+
+#
+# Local run (single application at given host)
+#
+
+if [ $# -eq 0 ]; then
+    echo -e "Application name is missing (if \"local\" options was not used it looks like script's bug). Exiting...\n"
+    usage
+    exit 1
+fi
+
+app=$1
+shift
+
+log 'debug' "local run at host \"$apphost\", action: $action, applications: $app"
+
+export APP_X_NAME=$app
+
+[ -f $APP_CONF_DIR/$app.env ] && . $APP_CONF_DIR/$app.env
+
+# get application's options from app.conf...
+declare -A app_options
+while IFS='=' read key value
+do
+    key=$(trim $key)
+    value=$(trim $value)
+    value=$(eval echo $value) # shell expansion
+    app_options[$key]=$value
+done < <(conf_cut $APPS_CONF | sed -n "s/^$app[[:blank:]]\+//p" | tr ',' '\n')
+
+# ... and add default options
+for opt_key in ${!APPCTL_DEFAULT_OPTIONS[@]}
+do
+    [ "x${app_options[$opt_key]}" == "x" ] && app_options[$opt_key]=${APPCTL_DEFAULT_OPTIONS[$opt_key]}
+done
+
+# 'run' is a synonym for 'script $action'
+if [ "x${app_options['run']}" != "x" ]; then
+    app_options['start']="${app_options['run']} start"
+    app_options['stop']="${app_options['run']} stop"
+    app_options['status']="${app_options['run']} status"
+fi
+
+# output for debug
+out_app_opt=''
+for key in ${!app_options[@]}; do
+    out_app_opt="$out_app_opt'$key'='${app_options[$key]}', "
+done
+log 'debug' "application: $app, options: ${out_app_opt%, }"
+
+#
+# main logic block
+#
+# check does application's action script exist
+# if control is disabled we need action script for any noncomposite action (start, stop and status)
+# else we need only start script to be defined
+# anycase if action script explicitly defined -- try to find and execute it
+# 
+
+app_script=''
+
+if [ "x${app_options[$action]}" == "x" ]; then
+    log 'debug' "application: \"$app\", action is undefined"
+
+    # some kind of "magic": if script for action is missing treat application name as a script
+    if [ "x$action" == "xstart" ]; then
+        app_script=$(find_exec $app)
+        if [ $? -ne 0 ]; then
+            print_status $app 'noexec'
+            exit 255
+        fi        
+    else
+        # if control is disabled -- script should be defined
+        if [ "x${app_options['control']}" == 'xdisable' ]; then
+            print_status $app 'undef'
+            exit 255
+        fi
+    fi
+else
+    log 'debug' "application: \"$app\", action is defined, looking for executable \"${app_options[$action]}\""
+    app_script=$(find_exec ${app_options[$action]})
+    if [ $? -ne 0 ]; then
+        print_status $app 'noexec'
+        exit 255
+    fi
+fi
+
+log 'debug' "application: \"$app\", action: \"$action\", action script: \"$app_script\", control: \"${app_options['control']}\""
+
+# pid file path
+APP_X_PID_FILE=${APP_PID_DIR}/${app}-${apphost}.pid
+if [ "x${APP_OLD_PID_DIR}" != "x" ]; then
+  [ -f "${APP_OLD_PID_DIR}/${app}-${apphost}.pid" ] && mv ${APP_OLD_PID_DIR}/${app}-${apphost}.pid ${APP_PID_DIR}
+fi
+
+#
+# perform action
+# if control state and action type require 'app_script' it should be defined already
+#
+
+run_script_log()
+{
+    local script_out
+    local script_status
+
+    script_out=$($app_script 2>&1)
+    script_status=$?
+
+    if [ "x$script_out" != "x" ]; then
+        script_out="$APP_X_NAME: $script_out"
+
+        if [ "$script_status" -ne 0 ]; then
+            log 'error' "$script_out"
+        else
+            log 'debug' "$script_out"
+        fi
+
+    fi
+
+    return $script_status
+}
+
+case $action in
+    start)
+        # check is application already running
+        $script --local status $app >/dev/null 2>&1
+        app_status=$?
+        if [ $app_status -eq 0 ]; then
+            print_status $app "already running"
+            exit 1
+        fi
+        
+        # start application
+        case "${app_options['control']}" in
+            disable)
+                run_script_log
+                exit_status=$?
+            ;;
+            export)
+                export APP_X_PID_FILE
+                run_script_log
+                exit_status=$?
+            ;;
+            full)
+                nohup $app_script $@ >>${APP_LOG_DIR}/$app-$apphost.out 2>&1 &
+                echo $! > ${APP_X_PID_FILE}
+            ;;
+            *)
+                echo "error: unknown control status \"${app_options['control']}\" (action is \"$action\")"
+                exit 1
+            ;;
+        esac
+
+        # sleep before status checking
+        sleep ${app_options['start_delay']}
+        
+        # check has app been started
+        if [ $app_status -eq 255 ] # can't get application's status from 'status' action, try to analize exit_status
+        then
+            if [ -z "$exit_status" ]; then
+                echo "error: looks like script bug, application is '$app', action is 'start' (there are no both app_status and exit_status)."
+                exit 1
+            else
+                app_status=$exit_status
+            fi
+        else
+            $script --local status $app >/dev/null 2>&1
+            app_status=$?
+        fi
+
+        if [ $app_status -eq 0 ]; then
+            print_status $app "started"
+            exit 0
+        else
+            print_status $app "failed"
+            exit 1
+        fi
+    ;;
+    stop)
+        # check is application already stopped
+        $script --local status $app >/dev/null 2>&1
+        app_status=$?
+        # if status script doesn't exist (status 255) we have to stop application anyway
+        if [ $(( $app_status % 255 )) -ne 0 ]; then
+            print_status $app "already down"
+            exit 1
+        fi
+
+        # stop application
+        case "${app_options['control']}" in
+            disable)
+                run_script_log
+                exit_status=$?
+            ;;
+            export|full)
+                kill_opt=''
+                [ $force -eq 1 ] && kill_opt='-9' 
+                kill $kill_opt $(cat $APP_X_PID_FILE) >/dev/null 2>&1
+            ;;
+            *)
+                echo "error: unknown control status \"${app_options['control']}\" (action is \"$action\")"
+                exit 1
+            ;;
+        esac
+
+        sleep ${app_options['stop_delay']}
+        
+        # check has app been stoppped
+        if [ $app_status -eq 255 ]; then
+            if [ -z "$exit_status" ]; then
+                echo "error: looks like script bug, application is '$app', action is 'stop' (there are no both app_status and exit_status)."
+                exit 1
+            else
+                app_status=$exit_status
+            fi
+        else
+            $script --local status $app >/dev/null 2>&1
+            app_status=$?
+        fi
+
+        if [ $app_status -ne 0 ]; then
+            [ -f "$APP_X_PID_FILE" ] && rm $APP_X_PID_FILE >/dev/null 2>&1
+            print_status $app "stopped"
+            exit 0
+        else
+            print_status $app "failed"
+            exit 1
+        fi
+
+    ;;
+    status)
+        app_status=0
+
+        if [ "x${app_options['control']}" == 'xdisable' ]; then 
+            run_script_log
+            app_status=$?
+        else
+            if [ -f $APP_X_PID_FILE ]; then
+                if ps -p $(cat $APP_X_PID_FILE) >/dev/null 2>&1; then
+                    kill -0 $(cat $APP_X_PID_FILE) >/dev/null 2>&1
+                    [ $? -ne 0 ] && log 'warning' "looks like \"$app\" is not responding to signals"
+                else
+                    log 'warning' "looks like \"$app\" is not running but pid file \"$APP_X_PID_FILE\" exists"
+                    [ $force -eq 1 ] && rm $APP_X_PID_FILE
+                    app_status=2
+                fi
+            else
+                # it's ok (treat application status as 'stopped' if pid file doesn't exist)
+                app_status=1
+            fi
+        fi
+
+        if [ $app_status -eq 0 ]; then
+            print_status $app 'up'
+        else
+            print_status $app 'down'
+        fi
+
+        exit $app_status
+    ;;
+    restart)
+        # 
+        # can't be here because restart action is handled above
+        #
+        echo "error: restart action is not supported in local mode"
+        exit 1
+    ;;
+    *)
+        echo "error: unrecognized \"$action\" action command line option"
+        exit 1
+    ;;
+esac
+
+# EOF

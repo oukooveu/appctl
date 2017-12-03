@@ -1,0 +1,23 @@
+#!/bin/bash
+#
+# appctl start script for elasticsearch
+#
+
+. $(cd $(dirname $0) && pwd)/export.inc || exit 1
+
+ELASTICSEARCH_CONF_DIR=${ELASTICSEARCH_CONF_DIR:-$ELASTICSEARCH_HOME/config}
+
+ES_BIN=${ELASTICSEARCH_HOME}/bin/elasticsearch
+ES_OPTS="-d -p ${APP_X_PID_FILE}"
+
+major_version=$(${ES_BIN} --version | awk '{print substr($2,1,index($2,".")-1)}')
+
+if [ $major_version -lt 5 ]; then
+    ES_OPTS="$ES_OPTS --path.conf=${ELASTICSEARCH_CONF_DIR}"
+else
+    ES_OPTS="$ES_OPTS -Epath.conf=${ELASTICSEARCH_CONF_DIR}"
+fi
+
+${ES_BIN} ${ES_OPTS}
+
+# EOF

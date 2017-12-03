@@ -1,0 +1,16 @@
+#!/bin/bash
+#
+# appctl start script for nginx
+#
+
+. $(cd $(dirname $0) && pwd)/export.inc || exit 1
+
+NGINX_CONF_DIR=${NGINX_CONF_DIR:-$NGINX_HOME}
+
+NGINX_BIN=${NGINX_HOME}/sbin/nginx
+NGINX_OPT="-c ${NGINX_CONF_DIR}/nginx.conf"
+
+${NGINX_BIN} -t ${NGINX_OPT} || exit $?
+eval ${NGINX_BIN} ${NGINX_OPT} -g "'pid ${APP_X_PID_FILE};'"
+
+# EOF

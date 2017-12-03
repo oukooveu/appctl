@@ -1,0 +1,17 @@
+#!/bin/bash
+
+[ $# -lt 1 ] && { echo "Usage: $0 <command>"; exit 1; }
+
+runpath="$(cd $(dirname $0) && pwd)"
+appconf=${APP_CONF_DIR:-$runpath/../conf}
+
+[ -f "${appconf}/app.hosts" ] || { echo "Can't find 'app.hosts' file in '$appconf'"; exit 1; }
+
+hosts=$(sed 's/#.*//' ${appconf}/app.hosts | awk '{print $1}')
+
+for host in $hosts; do
+    ssh $host $@ 2>&1 | sed "s/^/$host: /" &
+done
+wait
+
+# EOF

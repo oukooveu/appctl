@@ -1,0 +1,3 @@
+#!/bin/bash
+
+exit $(jps -l | grep org.apache.hadoop.hbase.master.HMaster >/dev/null 2>&1)

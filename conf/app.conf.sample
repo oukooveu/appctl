@@ -1,0 +1,33 @@
+# ${APP_CONF_DIR}/app.conf
+# 
+# Syntax: application option1=value1,option2=value2...
+#
+# Supported options:
+#   control={disable,export,full}
+#     disable: don't control application and track pid file
+#     export: application write down pid into APP_X_PID_FILE
+#     full: appctl track pid file by itself
+#   <action>=script
+#     define execution script for action
+#     supported actions: run, start, stop, status, restart
+#   common options:
+#     start_delay, stop_delay: delay (in seconds) after start or stop and before status check
+#
+# If application's actions is not configured here 
+# appctl trying to find script with the name of application
+# and treat it as 'start' script 
+#
+
+hdfs            start=${HADOOP_HOME}/sbin/start-dfs.sh,stop=${HADOOP_HOME}/sbin/stop-dfs.sh,status=hdfs-status,start_delay=5
+yarn            start=${HADOOP_HOME}/sbin/start-yarn.sh,stop=${HADOOP_HOME}/sbin/stop-yarn.sh,status=yarn-status
+hbase           start=${HBASE_HOME}/bin/start-hbase.sh,stop=${HBASE_HOME}/bin/stop-hbase.sh,status=hbase-status
+mysql           control=export,start_delay=5,stop_delay=5
+elasticsearch   control=export
+haproxy         run=run-haproxy
+nginx           control=export
+logstash        control=full,stop_delay=5,start=${LOGSTASH_HOME}/bin/logstash --allow-env -f ${LOGSTASH_HOME}/conf -l /tmp/logstash.log
+filebeat        control=full,start=${FILEBEAT_HOME}/filebeat -c ${FILEBEAT_HOME}/filebeat.yml
+topbeat         control=full,stop_delay=2,start=${TOPBEAT_HOME}/topbeat -c ${TOPBEAT_HOME}/topbeat.yml
+kibana          control=full,start=${KIBANA_HOME}/bin/kibana -e http://$ES_HOST:9200 -c ${KIBANA_HOME}/config/kibana.yml -l /tmp/kibana.log
+
+# EOF

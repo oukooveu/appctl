@@ -1,0 +1,155 @@
+#!/bin/bash
+#
+# run-haproxy for support-scripts repository
+#
+# script source can be found in debian/ubuntu haproxy package at /etc/init.d/haproxy
+# 
+
+if [ "x$HAPROXY_HOME" == "x" ]; then
+	HAPROXY_HOME=$(cd $(dirname $0) && pwd)
+	HAPROXY=$HAPROXY_HOME/haproxy
+	CONFIG=$HAPROXY_HOME/../conf/default/haproxy/haproxy.cfg
+	PIDFILE=/tmp/haproxy.pid
+else
+	HAPROXY=$HAPROXY_HOME/haproxy
+	CONFIG=$HAPROXY_HOME/haproxy.cfg
+	PIDFILE=$HAPROXY_HOME/haproxy.pid
+fi
+
+if [ -d "${HAPROXY_CONF_DIR}" ]; then
+	[ -f "${HAPROXY_CONF_DIR}/haproxy.cfg" ] && CONFIG=${HAPROXY_CONF_DIR}/haproxy.cfg
+fi
+
+EXTRAOPTS=""
+
+[ -x "$HAPROXY" ] || { echo "HAProxy binary \"$HAPROXY\" is not found or has incorrect mode"; exit 1; }
+[ -f "$CONFIG" ] || { echo "HAProxy config \"$CONFIG\" is not found"; exit 1; }
+
+check_haproxy_config()
+{
+	$HAPROXY -c -f "$CONFIG" >/dev/null 2>&1
+	if [ $? -eq 1 ]; then
+		echo "configuration of haproxy is incorrect, please fix."
+		exit 1
+	fi
+}
+
+haproxy_start()
+{
+	check_haproxy_config
+	[ -f $PIDFILE ] && return 1
+	$HAPROXY -f "$CONFIG" -D -p "$PIDFILE" $EXTRAOPTS || return 2
+	return 0
+}
+
+haproxy_stop()
+{
+	[ ! -f $PIDFILE ] && return 0
+	ret=0
+	pid=$(cat $PIDFILE)
+	kill $pid >/dev/null 2>&1 || ret=$?
+	[ $ret -eq 0 ] && rm -f $PIDFILE
+	return $ret
+}
+
+haproxy_reload()
+{
+	check_haproxy_config
+	$HAPROXY -f "$CONFIG" -p $PIDFILE -D $EXTRAOPTS -sf $(cat $PIDFILE) || return 2
+	return 0
+}
+
+haproxy_status()
+{
+	[ ! -f $PIDFILE ] && return 3
+	pid=$(cat $PIDFILE)
+	if ! $( ps --no-headers p "$pid" 2>/dev/null | grep haproxy >/dev/null ); then
+		return 1
+	fi
+	return 0
+}
+
+case "$1" in
+start)
+	echo "Starting haproxy..."
+	haproxy_start
+	ret=$?
+	case "$ret" in
+	0)
+		echo "Ok"
+		;;
+	1)
+		echo "pid file '$PIDFILE' found, haproxy not started."
+		;;
+	*)
+		echo "...something went wrong, check logs."
+		;;
+	esac
+	exit $ret
+	;;
+stop)
+	echo "Stopping haproxy..."
+	haproxy_stop
+	ret=$?
+	case "$ret" in
+	0)
+		echo "Ok"
+		;;
+	*)
+		echo "...something went wrong, kill process and remove pid manually."
+		;;
+	esac
+	exit $ret
+	;;
+reload|force-reload)
+	echo "Reloading haproxy..."
+	haproxy_reload
+	ret=$?
+	case "$ret" in
+	0)
+		echo "Ok"
+		;;
+	*)
+		echo "...failed to reload haproxy, check logs for details."
+		;;
+	esac
+	exit $ret
+	;;
+restart)
+	echo "Restarting haproxy"
+	haproxy_stop
+	haproxy_start
+	ret=$?
+	case "$ret" in
+	0)
+		echo "Ok"
+		;;
+	*)
+		echo "...restart has been failed, check logs for details."
+		;;
+	esac
+	exit $ret
+	;;
+status)
+	haproxy_status
+	ret=$?
+	case "$ret" in
+	0)
+		pid=$(cat $PIDFILE)
+		echo "haproxy is running (pid=$pid)."
+		;;
+	1)
+		echo "haproxy dead, but $PIDFILE exists."
+		;;
+	*)
+		echo "haproxy is not running."
+		;;
+	esac
+	exit $ret
+	;;
+*)
+	echo "Usage: /etc/init.d/haproxy {start|stop|reload|restart|status}"
+	exit 2
+	;;
+esac
+

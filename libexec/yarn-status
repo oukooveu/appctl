@@ -1,0 +1,6 @@
+#!/bin/bash
+
+$JAVA_HOME/bin/jps -l | grep org.apache.hadoop.yarn.server.resourcemanager.ResourceManager >/dev/null 2>&1
+
+exit $?
+
